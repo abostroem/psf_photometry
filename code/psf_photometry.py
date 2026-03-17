@@ -12,7 +12,10 @@ from utilities_az import visualization as vis
 from photutils.psf import extract_stars, EPSFBuilder, PSFPhotometry
 from photutils.background import Background2D, LocalBackground
 from photutils.centroids import centroid_com
+from astropy.modeling import models, fitting
+from photutils.aperture import CircularAnnulus, CircularAperture, aperture_photometry, ApertureStats
 from astropy.table import Table
+from astropy.visualization import simple_norm
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -20,22 +23,37 @@ import matplotlib as mpl
 import os
 import photutils
 
-def wrapper(cat, filename, sn_coords, filter, ext=1, bright_lim=18, faint_lim=20, sn_cutout_size=10, fig_dir='../figures', poly=None):
+def wrapper(cat, filename, sn_coords, filter, ext=1, 
+            bright_lim=18, faint_lim=20, sn_cutout_size=10, 
+            fig_dir='../figures', poly=None,
+            sn_background=None, nfwhm_aper=2, aper_annulus_offset=1):
     #can probably get filter by parsing the header (0th ext FILTER2)
     # Switch to Gaia catalog for PSF?
     img, epsf, psf_cat = build_psf(cat, filename, filter, ext=ext, visualize=True, bright_lim=bright_lim, faint_lim=faint_lim, fig_dir=fig_dir, poly=poly) 
     zeropoint_phot, phot_fig = do_photometry(psf_cat, img, epsf)
     phot_fig.savefig(os.path.join(fig_dir,f'{os.path.splitext(os.path.basename(filename))[0]}_psf_sub_residuals_zeropt.pdf'))
-    plt.close()
+    plt.close(phot_fig)
     sn_cat = make_sn_coord_table(filename, sn_coords, img, cutout_size=sn_cutout_size, ext=ext)
-    sn_phot, sn_fig = do_photometry(sn_cat, img, epsf)
+    sn_phot, sn_fig = do_photometry(sn_cat, img, epsf, background=sn_background)
     sn_fig.savefig(os.path.join(fig_dir, f'{os.path.splitext(os.path.basename(filename))[0]}_psf_sub_residuals_sn.pdf'))
     zeropoint = calc_zeropoint(filter, zeropoint_phot, psf_cat, filename, fig_dir=fig_dir)
-    sn_phot[f'inst_{filter}mag'] = calc_mag(sn_phot['flux_fit'])
-    sn_phot[f'app_{filter}mag'] = ((sn_phot[f'inst_{filter}mag'][0]+zeropoint)).item()
-    print(f"{filter}={sn_phot[f'app_{filter}mag'][0]} mag")
-    sn_phot.write(filename.replace('.fits', 'sn_phot.csv'), overwrite=True)
-    return sn_phot
+    print('PSF Photometry')
+    sn_phot[f'inst_mag_psf'] = calc_mag(sn_phot['flux_fit'])
+    sn_phot[f'app_mag_psf'] = ((sn_phot[f'inst_mag_psf'][0]+zeropoint)).item()
+    print(f"={sn_phot[f'app_mag_psf'][0]} mag")
+    sn_phot.write(filename.replace('.fits', f'sn_phot_{filter}.csv'), overwrite=True)
+    print('Aperture Photometry')
+    #instrumental_mag
+    sn_phot_aper, psf_aper_fig, fig_aper = do_aperture_photometry(img, epsf, sn_cat, nfwhm=nfwhm_aper, aper_annulus_offset=aper_annulus_offset)
+    psf_aper_fig.savefig(os.path.join(fig_dir, f'{os.path.splitext(os.path.basename(filename))[0]}_psf_gaussian_check.pdf'))
+    plt.close(psf_aper_fig)
+    fig_aper.savefig(os.path.join(fig_dir, f'{os.path.splitext(os.path.basename(filename))[0]}_apertures.pdf'))
+    plt.close(fig_aper)
+    sn_phot_aper['inst_mag_aper'] = -2.5*np.log10(sn_phot_aper['aperture_sum_bkgsub'])
+    sn_phot_aper[f'app_mag_aper'] = sn_phot_aper['inst_mag_aper']+zeropoint
+    sn_phot_aper.write(filename.replace('.fits', f'sn_phot_aper_{filter}.csv'), overwrite=True)
+    print(f"={sn_phot_aper[f'app_mag_aper'][0]} mag")
+    return sn_phot, sn_phot_aper
 
 def get_catalogs(sn_coords, sn_name, width=5.5, height=5.5, extended_mag_cut=0.1, cat_dir='../data'):
     apass_cat = query_apass(sn_coords, width=width, height=height)
@@ -249,10 +267,10 @@ def build_psf(cat, filename, filt, ext=1, visualize=False, backsub_size=108, cut
 
     return img, epsf, psf_cat
 
-def do_photometry(obj_cat, img, epsf, visualize=True, cutout_size=(51,51)):
+def do_photometry(obj_cat, img, epsf, visualize=True, cutout_size=(51,51), background=None):
     psfphot = PSFPhotometry(epsf, cutout_size,  
                   aperture_radius=13, #for initial flux estimate
-                  localbkg_estimator=None) #default is median - consider Background2D?
+                  localbkg_estimator=background) #default is median - consider Background2D?
     phot = psfphot(img, init_params=obj_cat['x_centroid', 'y_centroid'])
     temp_cat = obj_cat['x_centroid', 'y_centroid']
     temp_cat.rename_columns(['x_centroid', 'y_centroid'], ['x', 'y'])
@@ -300,7 +318,7 @@ def calc_zeropoint(filter, zeropoint_cat, psf_cat, filename, visualize=True, fig
         plt.close()
     return zeropoint
 
-def make_sn_coord_table(filename, sn_coords, img, cutout_size=25, ext=1):
+def make_sn_coord_table(filename, sn_coords, img, cutout_size=10, ext=1):
     wcs = WCS(fits.getheader(filename, ext))
     sn_pix = wcs.wcs_world2pix(sn_coords.ra, sn_coords.dec, 0)
     sn_cutout = img[int(np.floor(sn_pix[1]))-cutout_size:int(np.floor(sn_pix[1]))+cutout_size, int(np.floor(sn_pix[0]))-cutout_size:int(np.floor(sn_pix[0]))+cutout_size]
@@ -312,3 +330,54 @@ def make_sn_coord_table(filename, sn_coords, img, cutout_size=25, ext=1):
     if (np.abs(sn_cat['x_centroid']-sn_cat['x'])>5) | (np.abs(sn_cat['y_centroid']-sn_cat['y'])>5):
         print(f"Centroid ({sn_cat['x_centroid']:2.1f}, {sn_cat['y_centroid']:2.2f}) is >5 pix from estimated location ({sn_cat['x']:2.2f}, {sn_cat['y']:2.2f})")
     return sn_cat
+
+def do_aperture_photometry(img, epsf, sn_cat, visualize=True, fig_dir='../figures', nfwhm=2, aper_annulus_offset=1):
+    #fit a 2D Gaussian to ePSF image
+    model = models.Gaussian2D(amplitude=np.argmax(epsf.data),x_mean=epsf.data.shape[1]/2, y_mean=epsf.data.shape[0]/2)
+    y, x = np.mgrid[:epsf.data.shape[0], :epsf.data.shape[1]]
+    fitter = fitting.LMLSQFitter()
+    fit = fitter(model, x, y,epsf.data)
+    fig, [ax1, ax2, ax3] = plt.subplots(figsize=(8, 2.5), ncols=3)
+    if visualize:
+        plt.figure()
+        ax1.imshow(np.log(epsf.data), origin='lower', interpolation='nearest')
+        ax1.set_title("Data")
+        ax2.imshow(fit(x, y), origin='lower', interpolation='nearest', vmin=0,
+                vmax=0.02)
+        ax2.set_title("Model")
+        ax3.imshow(epsf.data - fit(x, y), origin='lower', interpolation='nearest', vmin=0,
+                vmax=0.02)
+        ax3.set_title("Residual")
+
+    #Use FWHM to define circular aperture and annulus aperture
+    aper_radius = nfwhm
+    source_aper = CircularAperture(r=aper_radius*np.mean([fit.x_fwhm, fit.y_fwhm]), 
+                                positions=[(sn_cat['x'][0], sn_cat['y'][0])])
+    bkg_annulus = CircularAnnulus(r_in=(aper_radius+aper_annulus_offset)*np.mean([fit.x_fwhm, fit.y_fwhm]), 
+                                r_out=(aper_radius+aper_annulus_offset+1)*np.mean([fit.x_fwhm, fit.y_fwhm]), 
+                                positions=[(sn_cat['x'][0], sn_cat['y'][0])])
+
+    if visualize:
+        fig_aper = plt.figure()
+        vmin, vmax = vis.zscale(img[int(sn_cat['y'])-25:int(sn_cat['y'])+25, int(sn_cat['x'])-25:int(sn_cat['x'])+25])
+        plt.imshow(img, interpolation='nearest', vmin=vmin, vmax=vmax)
+        ap_patch = source_aper.plot(color='white', lw=1,
+                           label='Photometry aperture')
+        bkg_patch = bkg_annulus.plot(color='red', lw=1,
+                           label='background annulus', ls=':')
+        plt.xlim(sn_cat['x'][0]-75, sn_cat['x'][0]+75)
+        plt.ylim(sn_cat['y'][0]-75, sn_cat['y'][0]+75)
+    #Pass to aperture photometry
+    sn_phot = aperture_photometry(img, source_aper)
+    #background
+    bkg_phot = aperture_photometry(img, bkg_annulus)
+    #scale bkg counts to source aperture size
+    aperstats = ApertureStats(img, bkg_annulus)
+    bkg_mean = aperstats.mean
+    aper_area = source_aper.area
+    aperture_area = source_aper.area_overlap(img)
+    total_bkg = bkg_mean * aperture_area
+    #background subtract
+    sn_phot['aperture_sum_bkgsub'] = sn_phot['aperture_sum']-total_bkg
+    return sn_phot, fig, fig_aper
+
