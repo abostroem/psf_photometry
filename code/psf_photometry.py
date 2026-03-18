@@ -316,7 +316,7 @@ def calc_zeropoint(filter, zeropoint_cat, psf_cat, filename, visualize=True, fig
         plt.plot(zeropoint_cat[f'{filter}mag'], zeropoint_cat[f'inst_{filter}mag'], '.')
         plt.savefig(os.path.join(fig_dir, f'{os.path.splitext(os.path.basename(filename))[0]}_zeropoint.pdf'))
         plt.close()
-    return zeropoint
+    return float(zeropoint) #sometimes this is a MaskedNDArray with a single value
 
 def make_sn_coord_table(filename, sn_coords, img, cutout_size=10, ext=1):
     wcs = WCS(fits.getheader(filename, ext))
